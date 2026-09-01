@@ -180,20 +180,26 @@ impl FsWriterBase {
     }
 
     fn has_pending_blocks(&self) -> bool {
-        self.cur_writer.is_some()
-            || !self.cache_writers.is_empty()
-            || self.file_blocks.has_commit_blocks()
+        self.cur_writer.is_some() || !self.cache_writers.is_empty()
     }
 
     // Write is completed, perform the following operations
     // 1. Submit the last block.
     pub async fn complete(&mut self) -> FsResult<()> {
-        self.complete0(false, None).await?;
+        if let Some(blocks) = self.complete0(false, None).await? {
+            self.pos = self.pos.min(blocks.len);
+            self.len = blocks.len;
+            self.file_blocks = WriteFileBlocks::new(blocks);
+        }
         Ok(())
     }
 
     pub async fn complete_with_attr(&mut self, opts: Option<SetAttrOpts>) -> FsResult<()> {
-        self.complete0(false, opts).await?;
+        if let Some(blocks) = self.complete0(false, opts).await? {
+            self.pos = self.pos.min(blocks.len);
+            self.len = blocks.len;
+            self.file_blocks = WriteFileBlocks::new(blocks);
+        }
         Ok(())
     }
 
@@ -335,6 +341,9 @@ impl FsWriterBase {
         self.cache_writers.clear();
 
         let commit_blocks = self.file_blocks.take_commit_blocks();
+        if commit_blocks.is_empty() && only_flush {
+            return Ok(None);
+        }
         // From this point onward a request may have reached the master even if
         // its response is lost. Treat every submitted block as durable before
         // crossing that ambiguity boundary so later cleanup never aborts it.
@@ -483,7 +492,11 @@ impl FsWriterBase {
             None => return Ok(()),
         };
 
-        if cache && self.cache_limit > 0 {
+        // Cache only empty in-progress writers (seek/overwrite). Once a writer has
+        // published bytes it must be committed before rotating blocks; caching a
+        // partial block leaves metadata uncommitted and surfaces EIO on the next
+        // 256KiB fio write after fallocate.
+        if cache && self.cache_limit > 0 && old.has_remaining() && old.is_empty() {
             if self.cache_writers.len() >= self.cache_limit {
                 if let Some((_, mut removed)) = self.cache_writers.pop_front() {
                     let commit_blocks = removed.complete().await?;
